@@ -1,2 +1,6 @@
-playwright>=1.40.0
+# Obligatoire (sources HTTP)
 requests>=2.31.0
+
+# Optionnel: seulement si vous voulez activer la source SEO SpyGlass (--spyglass)
+# pip install playwright && playwright install chromium
+# playwright>=1.40.0

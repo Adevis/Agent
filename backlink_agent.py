@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """
-Agent de scraping de backlinks via SEO SpyGlass (link-assistant.com)
-- Scan une liste d'URLs
-- Récupère les backlinks
-- Filtre les sites d'articles/blogs
-- Déduplique
-- Envoie les résultats sur Discord via webhook
+Agent de recherche de backlinks multi-sources.
+
+Sources HTTP (pas de navigateur requis):
+- GitHub code search
+- HackerNews (Algolia)
+- Wikipedia (exturlusage, toutes langues)
+- Reddit search
+- Common Crawl URL index
+- OpenLinkProfiler
+- Wayback Machine CDX
+
+Source navigateur (optionnelle, nécessite Playwright + Chromium):
+- SEO SpyGlass (link-assistant.com)
+
+Filtre les sites d'articles/blogs, déduplique, exporte en fichier texte
+et/ou envoie sur un webhook Discord.
 """
 
 import argparse
@@ -17,7 +27,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
+from backlink_sources import ALL_SOURCES, extract_domain
+
+# Import Playwright only if available — la source SEO SpyGlass est optionnelle
+try:
+    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    PWTimeout = Exception  # fallback
 
 SPYGLASS_URL = (
     "https://www.link-assistant.com/fr/seo-spyglass/free-backlink-checker-tool.html"
@@ -201,11 +220,13 @@ async def _extract_backlinks(page) -> set:
     return backlinks
 
 
-async def scrape_backlinks(urls, headless=True, include_articles=False):
-    """Scrape les backlinks pour la liste d'URLs fournie."""
-    all_backlinks = set()
-    per_url_results = {}
+async def scrape_spyglass(urls, headless=True):
+    """Scrape SEO SpyGlass pour chaque URL (nécessite Playwright + Chromium)."""
+    if not PLAYWRIGHT_AVAILABLE:
+        print("  [!] Playwright non installé: source SEO SpyGlass désactivée")
+        return {}
 
+    results = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
@@ -218,7 +239,7 @@ async def scrape_backlinks(urls, headless=True, include_articles=False):
         page = await context.new_page()
 
         for target in urls:
-            print(f"[*] Analyse de: {target}", flush=True)
+            print(f"  [spyglass] {target}", flush=True)
             found = set()
             try:
                 await page.goto(SPYGLASS_URL, wait_until="domcontentloaded", timeout=60000)
@@ -226,24 +247,77 @@ async def scrape_backlinks(urls, headless=True, include_articles=False):
                 await _submit_url(page, target)
                 found = await _extract_backlinks(page)
             except Exception as e:
-                print(f"  [!] Erreur pour {target}: {e}", flush=True)
-
-            filtered = set()
-            for link in found:
-                norm = normalize_url(link)
-                if not norm:
-                    continue
-                if not include_articles and is_article_site(norm):
-                    continue
-                filtered.add(norm)
-
-            per_url_results[target] = filtered
-            all_backlinks |= filtered
-            print(f"  -> {len(filtered)} backlinks retenus ({len(found)} bruts)", flush=True)
+                print(f"    [!] {e}", flush=True)
+            results[target] = found
 
         await browser.close()
+    return results
 
-    return all_backlinks, per_url_results
+
+def collect_backlinks(urls, enabled_sources, include_articles=False,
+                     github_token=None, use_spyglass=False, headless=True):
+    """
+    Orchestre toutes les sources activées, fusionne et filtre les résultats.
+
+    Retourne (all_backlinks:set, per_url_results:dict[url -> set], per_source:dict[name -> set])
+    """
+    all_backlinks = set()
+    per_url_results = {u: set() for u in urls}
+    per_source = {}
+
+    # --- Sources HTTP (par domaine) ---
+    for target in urls:
+        domain = extract_domain(target)
+        if not domain:
+            continue
+        print(f"[*] Analyse HTTP: {target} (domaine: {domain})", flush=True)
+
+        for name in enabled_sources:
+            fn = ALL_SOURCES.get(name)
+            if not fn:
+                continue
+            print(f"  [source] {name}", flush=True)
+            try:
+                if name == "github":
+                    found = fn(domain, token=github_token)
+                else:
+                    found = fn(domain)
+            except Exception as e:
+                print(f"    [!] {name}: {e}", flush=True)
+                found = set()
+            print(f"    -> {len(found)} résultats bruts", flush=True)
+            per_source.setdefault(name, set()).update(found)
+            per_url_results[target] |= found
+
+    # --- Source Playwright (SEO SpyGlass) ---
+    if use_spyglass:
+        print("[*] Analyse Playwright: SEO SpyGlass", flush=True)
+        try:
+            sp_results = asyncio.run(scrape_spyglass(urls, headless=headless))
+            for target, found in sp_results.items():
+                per_source.setdefault("spyglass", set()).update(found)
+                per_url_results.setdefault(target, set()).update(found)
+        except Exception as e:
+            print(f"  [!] SEO SpyGlass: {e}", flush=True)
+
+    # --- Filtrage + normalisation ---
+    def _filter(links):
+        out = set()
+        for link in links:
+            norm = normalize_url(link)
+            if not norm:
+                continue
+            if not include_articles and is_article_site(norm):
+                continue
+            out.add(norm)
+        return out
+
+    per_url_results = {t: _filter(v) for t, v in per_url_results.items()}
+    per_source = {n: _filter(v) for n, v in per_source.items()}
+    for links in per_url_results.values():
+        all_backlinks |= links
+
+    return all_backlinks, per_url_results, per_source
 
 
 def send_to_discord(webhook_url: str, backlinks, per_url_results):
@@ -279,13 +353,18 @@ def send_to_discord(webhook_url: str, backlinks, per_url_results):
             print(f"[!] Discord webhook error {r.status_code}: {r.text}", flush=True)
 
 
-def save_to_file(output_path: str, backlinks, per_url_results):
+def save_to_file(output_path: str, backlinks, per_url_results, per_source=None):
     """Sauvegarde les backlinks dans un fichier texte."""
     path = Path(output_path)
     lines = []
     lines.append(f"# Backlinks trouvés: {len(backlinks)} (hors sites d'articles)")
-    lines.append(f"# Généré depuis SEO SpyGlass")
     lines.append("")
+
+    if per_source:
+        lines.append("## Résumé par source")
+        for name, links in sorted(per_source.items()):
+            lines.append(f"- {name}: {len(links)} liens")
+        lines.append("")
 
     for target, links in per_url_results.items():
         lines.append(f"## {target} — {len(links)} liens")
@@ -324,9 +403,13 @@ def load_urls(args) -> list:
     return unique
 
 
+DEFAULT_HTTP_SOURCES = ["github", "hackernews", "wikipedia", "reddit",
+                       "commoncrawl", "openlinkprofiler", "wayback"]
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Scraper de backlinks SEO SpyGlass (sortie: fichier texte et/ou Discord)",
+        description="Agent multi-sources de recherche de backlinks",
     )
     parser.add_argument("urls", nargs="*", help="URLs à analyser")
     parser.add_argument("-f", "--file", help="Fichier texte contenant une URL par ligne")
@@ -338,29 +421,55 @@ def main():
     parser.add_argument(
         "-o", "--output",
         default="backlinks.txt",
-        help="Fichier de sortie pour les backlinks (défaut: backlinks.txt)",
+        help="Fichier de sortie (défaut: backlinks.txt)",
     )
+    parser.add_argument(
+        "-s", "--sources",
+        default=",".join(DEFAULT_HTTP_SOURCES),
+        help=f"Sources séparées par virgule. Disponibles: {','.join(ALL_SOURCES.keys())}",
+    )
+    parser.add_argument(
+        "--github-token",
+        default=os.environ.get("GITHUB_TOKEN"),
+        help="Token GitHub pour la source `github` (ou variable GITHUB_TOKEN)",
+    )
+    parser.add_argument("--spyglass", action="store_true",
+                        help="Activer aussi SEO SpyGlass (nécessite Playwright + Chromium)")
     parser.add_argument("--no-file", action="store_true",
-                        help="Désactive l'écriture dans un fichier")
+                        help="Désactive l'écriture du fichier de sortie")
     parser.add_argument("--include-articles", action="store_true",
                         help="Ne pas filtrer les sites d'articles/blogs")
     parser.add_argument("--headful", action="store_true",
-                        help="Lancer le navigateur en mode visible (debug)")
+                        help="Lancer le navigateur en mode visible (debug, pour --spyglass)")
     args = parser.parse_args()
 
     urls = load_urls(args)
     if not urls:
         parser.error("Fournissez au moins une URL (en argument ou via -f)")
 
+    enabled = [s.strip() for s in args.sources.split(",") if s.strip()]
+    unknown = [s for s in enabled if s not in ALL_SOURCES]
+    if unknown:
+        parser.error(f"Sources inconnues: {unknown}. Disponibles: {list(ALL_SOURCES.keys())}")
+
     print(f"[*] {len(urls)} URL(s) à analyser", flush=True)
-    backlinks, per_url = asyncio.run(
-        scrape_backlinks(urls, headless=not args.headful, include_articles=args.include_articles)
+    print(f"[*] Sources actives: {enabled}" + (" + spyglass" if args.spyglass else ""), flush=True)
+
+    backlinks, per_url, per_source = collect_backlinks(
+        urls,
+        enabled_sources=enabled,
+        include_articles=args.include_articles,
+        github_token=args.github_token,
+        use_spyglass=args.spyglass,
+        headless=not args.headful,
     )
 
-    print(f"[*] Total backlinks uniques: {len(backlinks)}", flush=True)
+    print(f"[*] Total backlinks uniques (après filtrage): {len(backlinks)}", flush=True)
+    for name, links in per_source.items():
+        print(f"    - {name}: {len(links)}", flush=True)
 
     if not args.no_file:
-        save_to_file(args.output, backlinks, per_url)
+        save_to_file(args.output, backlinks, per_url, per_source)
 
     if args.webhook:
         send_to_discord(args.webhook, backlinks, per_url)
