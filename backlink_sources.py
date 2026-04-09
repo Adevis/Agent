@@ -46,60 +46,87 @@ def _safe_get(url, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# 1. GitHub code search
+# 1. GitHub search (code + issues + commits + repositories)
 # ---------------------------------------------------------------------------
-def fetch_github_code(domain: str, token: str = None, max_pages: int = 10) -> set:
-    """
-    Fichiers sur GitHub qui contiennent le domaine cible (code, docs, README).
-    Retourne les URLs HTML des fichiers trouvés.
-
-    - Sans token: 10 req/min (authenticated search).
-    - Avec token: 30 req/min + plus de résultats.
-    """
-    results = set()
+def _github_search(endpoint: str, query: str, token: str = None,
+                   accept: str = "application/vnd.github+json",
+                   max_pages: int = 10) -> list:
+    """Pagine un endpoint de recherche GitHub et retourne la liste des items."""
     headers = dict(DEFAULT_HEADERS)
-    headers["Accept"] = "application/vnd.github+json"
+    headers["Accept"] = accept
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
+    items = []
     for page in range(1, max_pages + 1):
         try:
             r = requests.get(
-                "https://api.github.com/search/code",
-                params={
-                    "q": f'"{domain}"',
-                    "per_page": 100,
-                    "page": page,
-                },
+                f"https://api.github.com/search/{endpoint}",
+                params={"q": query, "per_page": 100, "page": page},
                 headers=headers,
                 timeout=30,
             )
         except Exception as e:
-            print(f"  [!] GitHub request failed: {e}")
+            print(f"    [!] github/{endpoint} request failed: {e}")
             break
 
         if r.status_code == 401:
-            print("  [!] GitHub: 401 (code search requires authentication)")
+            print(f"    [!] github/{endpoint}: 401 (auth required)")
             break
         if r.status_code == 403:
-            print(f"  [!] GitHub rate-limited: {r.headers.get('X-RateLimit-Reset')}")
+            reset = r.headers.get("X-RateLimit-Reset", "?")
+            print(f"    [!] github/{endpoint}: rate-limited (reset={reset})")
+            break
+        if r.status_code == 422:
+            # query mal formée ou non supportée
             break
         if r.status_code != 200:
-            print(f"  [!] GitHub status {r.status_code}: {r.text[:200]}")
+            print(f"    [!] github/{endpoint}: status {r.status_code}")
             break
 
-        data = r.json()
-        items = data.get("items", [])
-        if not items:
+        page_items = r.json().get("items", [])
+        if not page_items:
             break
-        for it in items:
-            html_url = it.get("html_url")
-            if html_url:
-                results.add(html_url)
+        items.extend(page_items)
+        if len(page_items) < 100:
+            break
+        time.sleep(2)
+    return items
 
-        if len(items) < 100:
-            break
-        time.sleep(2)  # respect rate limit
+
+def fetch_github_code(domain: str, token: str = None, max_pages: int = 10) -> set:
+    """
+    Recherche GitHub multi-endpoints pour trouver les mentions du domaine:
+    - repositories (sans auth)
+    - issues (sans auth)
+    - commits (sans auth, via l'API cloak)
+    - code (nécessite un token)
+    """
+    results = set()
+    query = f'"{domain}"'
+
+    # Endpoints sans auth
+    for item in _github_search("repositories", query, max_pages=max_pages):
+        if item.get("html_url"):
+            results.add(item["html_url"])
+
+    for item in _github_search("issues", query, max_pages=max_pages):
+        if item.get("html_url"):
+            results.add(item["html_url"])
+
+    for item in _github_search("commits", query,
+                               accept="application/vnd.github.cloak-preview",
+                               max_pages=max_pages):
+        if item.get("html_url"):
+            results.add(item["html_url"])
+
+    # Endpoint code: nécessite un token
+    if token:
+        for item in _github_search("code", query, token=token, max_pages=max_pages):
+            if item.get("html_url"):
+                results.add(item["html_url"])
+    else:
+        print("    [i] github/code: skipped (pas de token)")
 
     return results
 
