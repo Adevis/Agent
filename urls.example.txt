@@ -1,0 +1,3 @@
+# Une URL par ligne, les lignes commençant par # sont ignorées
+https://example.com
+https://mon-site.fr
