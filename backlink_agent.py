@@ -279,6 +279,28 @@ def send_to_discord(webhook_url: str, backlinks, per_url_results):
             print(f"[!] Discord webhook error {r.status_code}: {r.text}", flush=True)
 
 
+def save_to_file(output_path: str, backlinks, per_url_results):
+    """Sauvegarde les backlinks dans un fichier texte."""
+    path = Path(output_path)
+    lines = []
+    lines.append(f"# Backlinks trouvés: {len(backlinks)} (hors sites d'articles)")
+    lines.append(f"# Généré depuis SEO SpyGlass")
+    lines.append("")
+
+    for target, links in per_url_results.items():
+        lines.append(f"## {target} — {len(links)} liens")
+        for link in sorted(links):
+            lines.append(link)
+        lines.append("")
+
+    lines.append("## Tous les backlinks uniques (dédupliqués)")
+    for link in sorted(backlinks):
+        lines.append(link)
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[*] {len(backlinks)} backlinks sauvegardés dans {path.resolve()}", flush=True)
+
+
 def load_urls(args) -> list:
     urls = []
     if args.urls:
@@ -304,15 +326,22 @@ def load_urls(args) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scraper de backlinks SEO SpyGlass + envoi Discord",
+        description="Scraper de backlinks SEO SpyGlass (sortie: fichier texte et/ou Discord)",
     )
     parser.add_argument("urls", nargs="*", help="URLs à analyser")
     parser.add_argument("-f", "--file", help="Fichier texte contenant une URL par ligne")
     parser.add_argument(
         "-w", "--webhook",
         default=os.environ.get("DISCORD_WEBHOOK_URL"),
-        help="URL du webhook Discord (ou variable DISCORD_WEBHOOK_URL)",
+        help="URL du webhook Discord (optionnel, ou variable DISCORD_WEBHOOK_URL)",
     )
+    parser.add_argument(
+        "-o", "--output",
+        default="backlinks.txt",
+        help="Fichier de sortie pour les backlinks (défaut: backlinks.txt)",
+    )
+    parser.add_argument("--no-file", action="store_true",
+                        help="Désactive l'écriture dans un fichier")
     parser.add_argument("--include-articles", action="store_true",
                         help="Ne pas filtrer les sites d'articles/blogs")
     parser.add_argument("--headful", action="store_true",
@@ -322,8 +351,6 @@ def main():
     urls = load_urls(args)
     if not urls:
         parser.error("Fournissez au moins une URL (en argument ou via -f)")
-    if not args.webhook:
-        parser.error("Webhook Discord manquant (--webhook ou DISCORD_WEBHOOK_URL)")
 
     print(f"[*] {len(urls)} URL(s) à analyser", flush=True)
     backlinks, per_url = asyncio.run(
@@ -331,8 +358,15 @@ def main():
     )
 
     print(f"[*] Total backlinks uniques: {len(backlinks)}", flush=True)
-    send_to_discord(args.webhook, backlinks, per_url)
-    print("[*] Envoi Discord terminé", flush=True)
+
+    if not args.no_file:
+        save_to_file(args.output, backlinks, per_url)
+
+    if args.webhook:
+        send_to_discord(args.webhook, backlinks, per_url)
+        print("[*] Envoi Discord terminé", flush=True)
+    else:
+        print("[*] Pas de webhook Discord fourni, envoi ignoré", flush=True)
 
 
 if __name__ == "__main__":
